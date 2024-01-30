@@ -1,0 +1,74 @@
+CNV原理
+官网：https://link.zhihu.com/?target=https%3A//github.com/broadinstitute/inferCNV/wiki   
+代码讲解：
+需要3个输入文件
+1.counts 数据
+1.1表达矩阵文件。counts矩阵，每列为一个细胞，每行为一个基因。如果有seurat对象，提取矩阵的方式如下。 
+library(Seurat)
+library(infercnv)
+​
+#查看数据
+seurat_object <- readRDS('seurat_object.rds')
+levels(seurat_object)
+#筛选分析需要的细胞类型
+seurat_object <- subset(seurat_object, idents=c('Epithelial cells', 'Myeloid cells', 'T cells'))
+#抽样，仅用于该教程
+seurat_object <- subset(seurat_object, downsample=200)
+counts <- GetAssayData(seurat_object, slot = 'counts')
+    1.2 细胞类型注释文件。第一列为细胞barcode，第二列为细胞类型名称。如果有seurat对象，提取注释的方式如下。
+   
+anno <- data.frame(Idents(seurat_object))
+  1.3.基因注释文件。第一列为基因名称，第二列为染色体名称，第三列为基因起始位置，第四列为基因终止位置。文件制作方式见https://link.zhihu.com/?target=https%3A//github.com/broadinstitute/inferCNV/wiki/instructions-create-genome-position-file
+  
+#先把脚本下载下来，再处理gtf文件，生成human_genes_pos.txt，https://github.com/broadinstitute/infercnv/tree/master/scripts
+#python ./scripts/gtf_to_position_file.py --attribute_name "gene_name" your_reference.gtf human_genes_pos.txt
+   
+gene_order <- "human_genes_pos.txt"
+ 2.创建inferCNV对象        
+进行这一步之前，需要确定问题1的答案。测试数据为乳腺癌样本，肿瘤恶性细胞来源于上皮细胞，所以我们的目标就是鉴定上皮细胞中的恶性细胞。这是根据背景知识判定的，当然如果不知道的话，可以把所有细胞一起进行inferCNV分析，观察哪种细胞的CNV最明显。                                                                                                                                                                                                                             
+
+infercnv_obj = CreateInfercnvObject(raw_counts_matrix = counts,
+                                        annotations_file = anno,
+                                        delim="\t",
+                                        gene_order_file = gene_order,
+                                        min_max_counts_per_cell = c(100, +Inf),
+                                        ref_group_names = c("Myeloid cells", "T cells"))
+ 参数ref_group_names用来指定正常细胞类型，那剩下的细胞类型就会被认为是潜在的恶性细胞，用于鉴定。和很多文章一样，优先选择免疫细胞作为参考。这里选择Myeloid cells、T cells作为参考，剩下的Epithelial cells作为目标细胞类型        
+3.运行inferCNV                        
+
+infercnv_obj = infercnv::run(infercnv_obj,
+                                 cutoff = 0.1,
+                                 out_dir = ".", 
+                                 cluster_by_groups = F,
+                                 k_obs_groups = 8,
+                                 HMM = FALSE,
+                                 denoise = TRUE,
+                                 num_threads = 8)    
+  run函数参数众多，简单说明一下常用参数的功能。
+- cutoff：默认0.1，过滤低表达基因
+- min_cells_per_gene：默认3，过滤表达比例较低基因- window_length：默认101，滑窗中包含的基因数目
+- cluster_by_groups：默认FALSE，对肿瘤细胞进行聚类，展示为不同的亚群
+- k_obs_groups：默认1，肿瘤细胞聚类数目
+- num_threads：线程数- denoise：默认FALSE，对CNV矩阵进行降噪                
+
+- Removing lowly expressed genes
+过滤基因，参数：cutoff，min_cells_per_gene。根据cutoff参数过滤低表达基因，min_cells_per_gene参数过滤表达比例较低的基因，所以inferCNV并不是用全部的基因进行分析的。
+- normalization by sequencing depth
+标准化数据。数据标准化的方法就是细胞内某个基因的count值除去细胞内总的count值，再乘上normalize_factor。默认normalize_factor是每个细胞总count值的中位数。       
+- log transformation of data
+对数转换。计算方式是表达值+1后取log2对数。
+- removing average of reference data (before smoothing)
+减去参考细胞表达平均值。如果提供了参考细胞，则统计每个参考细胞类型中每个基因的表达平均值，参考细胞类型有多个，进一步计算平均值，再将所有细胞的表达矩阵减去基因表达均值。如果没有提供参考细胞，则将整体表达矩阵的平均值作为参考细胞的基因表达均值。这里也就基本实现了CNV的初步推断，凡是表达比参考细胞高的，就认为是发生了扩增，比参考细胞低的，就认为是发生了缺失。
+- apply max centered expression threshold: 3
+处理极值。max_centered_threshold参数默认值为3，意思就是大于该值的重新赋值为max_centered_threshold，小于-1 x 该值的重新赋值为-1 x max_centered_threshold。
+- Smoothing data per cell by chromosome
+染色体平滑处理。以上只是统计了每个基因相对于参考细胞表达的变化，怎么能知道染色体每个位置上的CNV情况呢？记得上面我们输入过基因的位置信息，那么在一定长度染色体上的基因表达的变化，也就能反应这段区域CNV的情况了。smooth_method参数默认为pyramidinal，window_length参数默认为101个基因。首先获得每个染色体上所有基因的表达数据，并按位置排序，然后进行平滑处理，确保相邻的位置有相似的CNV变异。
+- re-centering data across chromosome after smoothing
+进一步中心化。平滑处理之后，计算每个细胞中CNV值的中位数，并将每个基因的CNV值减去中位数。
+- removing average of reference data (after smoothing)
+再次减去参考细胞CNV均值。统计方法同上。
+- invert log2(FC) to FC
+对数转换成指数。上面的数据处理时，将基因表达矩阵进行了对数转换，这里将数据转换回来。
+- Denoising
+降噪，需要参数denoise，sd_amplifier，noise_logistic。denoise默认为FALSE，设置为TRUE进行降噪。sd_amplifier默认值为1.5，执行放大标准差的功能。这个步骤的主要目的是为了降低正常细胞中的残留信号，同时保留肿瘤细胞中的信号。具体算法是先统计每个参考细胞中CNV均值，再统计每个细胞中CNV值的标准差*sd_amplifier的均值。以第一个均值+-第二个均值算出上下边界，所有细胞中每个基因的CNV值在边界里的重新赋值为第一个均值。降噪完成后就得到最终的基因CNV矩阵。
+noise_logistic默认为FALSE，设置为TRUE时，应用一个logistic函数来生成一个过滤梯度，该函数可以减少接近平均值的CNV的强度，而不是远离平均值的CNV的强度。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
